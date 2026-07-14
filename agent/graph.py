@@ -28,17 +28,22 @@ Graph shape:
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import date
-from typing import Any, Literal, Optional, TypedDict
+from pathlib import Path
+from typing import Literal, Optional, TypedDict
 
 import anthropic
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import interrupt
 
-from agent.tools.tool_schemas import ALL_TOOLS, GET_CALENDAR_EVENTS, GET_HEALTH_DATA
+from agent.integrations import calendar_client, terra_client
+from agent.services import token_service
+from agent.tools.tool_schemas import GET_CALENDAR_EVENTS, GET_HEALTH_DATA
 
-SYSTEM_PROMPT = open("agent/prompts/system_prompt.md").read().split("```text")[1].split("```")[0]
+_PROMPT_PATH = Path(__file__).parent / "prompts" / "system_prompt.md"
+SYSTEM_PROMPT = _PROMPT_PATH.read_text().split("```text")[1].split("```")[0]
 
 client = anthropic.Anthropic()
 MODEL = "claude-opus-4-8"
@@ -63,6 +68,7 @@ class AgentState(TypedDict, total=False):
     assessment: dict                # {"recovery": "low|moderate|good", "verdict": "keep|change", ...}
     proposal: Optional[Proposal]    # the ONE pending proposal, if any
     approval: Optional[Literal["approved", "rejected"]]
+    approval_token: Optional[str]   # minted by the app on Approve, burned in apply
     revision_count: int             # rejected proposals get at most one revision
     applied: bool
     audit_log: list[dict]           # append-only record of everything the agent did
@@ -70,34 +76,19 @@ class AgentState(TypedDict, total=False):
 
 # --------------------------------------------------------------------------
 # Tool executors (application-side; the model never talks to Terra/Google
-# directly). Real implementations live behind these two functions.
+# directly).
 # --------------------------------------------------------------------------
 
 def execute_tool(name: str, tool_input: dict, state: AgentState) -> dict:
     if name == "get_health_data":
-        return fetch_terra_metrics(state["user_id"], **tool_input)      # TODO: Terra API client
+        return terra_client.get_health_data(state["user_id"], **tool_input)
     if name == "get_calendar_events":
-        return fetch_calendar_events(state["user_id"], **tool_input)    # TODO: Google/Outlook client
+        return calendar_client.get_calendar_events(state["user_id"], **tool_input)
     if name == "reschedule_workout":
         # Defense in depth: the model should never reach this outside the
         # apply node, and even there the token is validated server-side.
         raise PermissionError("reschedule_workout can only run in the apply node")
     raise ValueError(f"unknown tool {name}")
-
-
-def fetch_terra_metrics(user_id: str, metrics: list[str], days_back: int) -> dict:
-    raise NotImplementedError
-
-
-def fetch_calendar_events(user_id: str, start_date: str, end_date: str, include: list[str]) -> dict:
-    raise NotImplementedError
-
-
-def apply_calendar_change(user_id: str, proposal: Proposal, approval_token: str) -> dict:
-    """Validate the token (bound to this proposal's hash, single-use, short
-    TTL), verify the target event is agent-managed, then write via the
-    calendar API. Raises on any validation failure."""
-    raise NotImplementedError
 
 
 # --------------------------------------------------------------------------
@@ -132,18 +123,33 @@ def reason(state: AgentState) -> AgentState:
         "calendar": state["calendar"],
         "rejected_proposal": state.get("proposal") if state.get("approval") == "rejected" else None,
     }
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=16000,
-        thinking={"type": "adaptive"},
-        system=[{"type": "text", "text": SYSTEM_PROMPT,
-                 "cache_control": {"type": "ephemeral"}}],
-        # Read tools stay available so the model can pull more history if a
-        # trend looks ambiguous; the write tool is deliberately absent here.
-        tools=[GET_HEALTH_DATA, GET_CALENDAR_EVENTS],
-        output_config={"format": {"type": "json_schema", "schema": ASSESSMENT_SCHEMA}},
-        messages=[{"role": "user", "content": json.dumps(context)}],
-    )
+    messages = [{"role": "user", "content": json.dumps(context)}]
+    while True:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=16000,
+            thinking={"type": "adaptive"},
+            system=[{"type": "text", "text": SYSTEM_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            # Read tools stay available so the model can pull more history if a
+            # trend looks ambiguous; the write tool is deliberately absent here.
+            tools=[GET_HEALTH_DATA, GET_CALENDAR_EVENTS],
+            output_config={"format": {"type": "json_schema", "schema": ASSESSMENT_SCHEMA}},
+            messages=messages,
+        )
+        if response.stop_reason != "tool_use":
+            break
+        messages.append({"role": "assistant", "content": response.content})
+        tool_results = [
+            {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(execute_tool(block.name, block.input, state)),
+            }
+            for block in response.content
+            if block.type == "tool_use"
+        ]
+        messages.append({"role": "user", "content": tool_results})
     result = json.loads(next(b.text for b in response.content if b.type == "text"))
     audit = state.get("audit_log", []) + [{"event": "assessment", "data": result}]
     return {
@@ -158,24 +164,32 @@ def propose(state: AgentState) -> AgentState:
     """Surface the proposal and PAUSE. `interrupt()` checkpoints the thread and
     returns control to the application, which renders Approve/Reject buttons.
     The graph resumes — possibly days later, possibly after a restart — when
-    the app calls graph.invoke(Command(resume=<decision>), config)."""
+    the app calls graph.invoke(Command(resume=<decision>), config). On Approve,
+    the app mints an approval token bound to this exact proposal
+    (token_service.mint_token) and passes it in the resume payload."""
     decision = interrupt({
         "type": "approval_request",
         "proposal": state["proposal"],
         "rationale": state["proposal"]["rationale"],
     })
-    return {"approval": "approved" if decision.get("approved") else "rejected"}
+    approved = bool(decision.get("approved"))
+    return {
+        "approval": "approved" if approved else "rejected",
+        "approval_token": decision.get("approval_token") if approved else None,
+        "revision_count": state.get("revision_count", 0) + (0 if approved else 1),
+    }
 
 
 def apply(state: AgentState) -> AgentState:
-    """Only reachable after an explicit approval. The app minted an
-    approval_token when the user clicked Approve; apply_calendar_change
-    re-validates it against the proposal hash before touching the calendar."""
-    result = apply_calendar_change(
-        state["user_id"], state["proposal"], approval_token=_pop_token(state)
+    """Only reachable after an explicit approval. The token minted at Approve
+    time is re-validated against this proposal's content hash and burned
+    (single-use) before anything touches the calendar."""
+    token_service.validate_and_consume(
+        state.get("approval_token") or "", state["user_id"], state["proposal"]
     )
+    result = calendar_client.apply_calendar_change(state["user_id"], state["proposal"])
     audit = state.get("audit_log", []) + [{"event": "applied", "data": result}]
-    return {"applied": True, "audit_log": audit}
+    return {"applied": True, "approval_token": None, "audit_log": audit}
 
 
 # --------------------------------------------------------------------------
@@ -212,8 +226,11 @@ def build_graph(checkpoint_path: str = "agent_state.sqlite"):
 
     # The checkpointer is what makes the plan survive session end: every node
     # transition is persisted keyed by thread_id, and interrupt() parks the
-    # thread at the approval gate indefinitely.
-    return g.compile(checkpointer=SqliteSaver.from_conn_string(checkpoint_path))
+    # thread at the approval gate indefinitely. (from_conn_string() is a
+    # context manager in current langgraph; construct from a connection so the
+    # saver lives as long as the graph.)
+    conn = sqlite3.connect(checkpoint_path, check_same_thread=False)
+    return g.compile(checkpointer=SqliteSaver(conn))
 
 
 # Usage from the application:
@@ -222,11 +239,17 @@ def build_graph(checkpoint_path: str = "agent_state.sqlite"):
 #   config = {"configurable": {"thread_id": user_id}}
 #
 #   # Morning cron / webhook kicks off a cycle:
-#   graph.invoke({"user_id": user_id}, config)          # runs until interrupt or END
+#   result = graph.invoke({"user_id": user_id}, config)  # runs until interrupt or END
 #
-#   # Later, when the user taps a button in the app:
+#   # Later, when the user taps Approve in the app:
 #   from langgraph.types import Command
-#   graph.invoke(Command(resume={"approved": True}), config)
+#   from agent.services import token_service
+#   pending = graph.get_state(config).values["proposal"]
+#   token = token_service.mint_token(user_id, pending)
+#   graph.invoke(Command(resume={"approved": True, "approval_token": token}), config)
+#
+#   # Or Reject:
+#   graph.invoke(Command(resume={"approved": False}), config)
 
 
 ASSESSMENT_SCHEMA = {
@@ -274,9 +297,3 @@ ASSESSMENT_SCHEMA = {
 def _plus_days(iso_day: str, n: int) -> str:
     from datetime import timedelta
     return (date.fromisoformat(iso_day) + timedelta(days=n)).isoformat()
-
-
-def _pop_token(state: AgentState) -> str:
-    """The app stores the freshly-minted single-use token alongside the
-    checkpoint when the user approves; retrieve and invalidate it here."""
-    raise NotImplementedError

@@ -58,8 +58,20 @@ Three design decisions carry most of the weight:
 
 ## Implementation status
 
-This is the core design + skeleton: the graph, prompts, and schemas are
-complete; the Terra client, calendar clients, and approval-token service are
-stubbed (`NotImplementedError`) as the next build step.
+The graph, prompts, schemas, and all three integration layers are implemented:
 
-Requirements when wiring it up: `anthropic`, `langgraph`, `langgraph-checkpoint-sqlite`.
+| Path | What it is |
+|---|---|
+| `agent/integrations/terra_client.py` | Terra REST client for `get_health_data`: daily HRV / sleep / resting-HR with 7-day baselines, sanity-band flagging of suspect readings, staleness detection. Env: `TERRA_API_KEY`, `TERRA_DEV_ID`. |
+| `agent/integrations/calendar_client.py` | Google Calendar client (`calendar.events` scope only): event fetch + workout/academic classification, and the validated write path — agent-managed events only, health-data screen on outgoing text. Env: `GOOGLE_TOKEN_DIR` (per-user authorized-user JSON files). |
+| `agent/services/token_service.py` | Single-use approval tokens: HMAC-signed, bound to user + proposal content hash, 15-minute TTL, burned in SQLite on use. Env: `APPROVAL_TOKEN_SECRET`. |
+| `tests/` | 31 tests: unit tests per module with mocked API responses, plus end-to-end graph flow tests (pause at approval gate, approve-and-apply, reject, forged-token block). |
+
+```bash
+pip install -r requirements.txt
+python -m pytest tests/
+```
+
+Remaining before production: the OAuth consent flow that produces the per-user
+Google token files, Terra user onboarding (widget session → user_id mapping),
+and the app surface that renders proposals and mints tokens on Approve.

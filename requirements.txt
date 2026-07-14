@@ -1,0 +1,13 @@
+# Core agent
+anthropic>=0.60
+langgraph>=0.4
+langgraph-checkpoint-sqlite>=2.0
+
+# Integrations
+requests>=2.31
+google-api-python-client>=2.100
+google-auth>=2.30
+google-auth-oauthlib>=1.2
+
+# Dev / test
+pytest>=8.0
