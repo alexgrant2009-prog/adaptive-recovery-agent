@@ -1,0 +1,49 @@
+{
+  "name": "BlackoutBakery",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "BlackoutBakery": {
+        "$className": "Folder",
+        "$path": "src/shared"
+      }
+    },
+
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "BlackoutBakery": {
+        "$className": "Folder",
+        "$path": "src/server"
+      }
+    },
+
+    "ServerStorage": {
+      "$className": "ServerStorage",
+      "BlackoutBakery": {
+        "$className": "Folder",
+        "$path": "src/serverstorage"
+      }
+    },
+
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "$path": "src/client"
+      }
+    },
+
+    "Workspace": {
+      "$className": "Workspace",
+      "$properties": {
+        "FilteringEnabled": true
+      }
+    },
+
+    "Lighting": {
+      "$className": "Lighting"
+    }
+  }
+}
